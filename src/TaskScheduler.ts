@@ -29,6 +29,10 @@ export class TaskScheduler {
   }
 
   private parseSchedule(scheduleString: string, backupCooldownSeconds: number = 0): ScheduleConfig {
+    if (!scheduleString.trim()) {
+      throw new Error("Schedule string cannot be empty");
+    }
+
     const match = scheduleString.match(/^(.*?)(?:\s*@\s*(\d+))?$/);
     if (!match) {
       return {
@@ -102,29 +106,25 @@ export class TaskScheduler {
     if (!this.immediateEnvName) {
       return false;
     }
-    const env = process.env as { [key: string]: string | undefined };
-    return env[this.immediateEnvName] !== undefined;
+    return process.env[this.immediateEnvName] !== undefined;
   }
 
   async run(): Promise<void> {
     if (!this.shouldRunImmediately()) {
       this.logger.info(`Scheduling tasks. Pattern: ${this.scheduleConfig.schedule}, ` + `Cooldown: ${this.scheduleConfig.cooldown / 1000} seconds`);
 
-      // Stop any existing cron job before creating a new one
+      // Clean up any existing job before creating a new one
       this.stop();
 
-      this.cronJob = new CronJob(
-        this.scheduleConfig.schedule,
-        () => this.executor(),
-        null, // onComplete
-        true, // start immediately
-        undefined, // timezone
-        undefined, // context
-        false, // runOnInit
-        undefined // utcOffset
-      );
+      try {
+        this.cronJob = new CronJob(this.scheduleConfig.schedule, () => this.executor());
+        this.cronJob.start();
+      } catch (error) {
+        this.logger.error("Failed to start cron job:", error);
+        throw error;
+      }
     } else {
-      const envValue = (process.env as { [key: string]: string | undefined })[this.immediateEnvName!];
+      const envValue = process.env[this.immediateEnvName!];
       this.logger.info(`Running immediately (${this.immediateEnvName}=${envValue})`);
       await this.executor();
     }
@@ -133,9 +133,8 @@ export class TaskScheduler {
   stop(): void {
     if (this.cronJob) {
       this.cronJob.stop();
-      this.logger.info("Stopped scheduling future runs.");
-      // Clean up the reference
       this.cronJob = undefined;
+      this.logger.info("Stopped scheduling future runs.");
     }
   }
 }

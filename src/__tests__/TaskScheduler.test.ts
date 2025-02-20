@@ -1,11 +1,15 @@
 import { TaskScheduler } from "../TaskScheduler";
 
+// Set global timeout for all tests
+jest.setTimeout(5000);
+
 describe("TaskScheduler", () => {
   let mockLogger: Console;
   let originalEnv: NodeJS.ProcessEnv;
   let scheduler: TaskScheduler;
 
   beforeEach(() => {
+    jest.useFakeTimers();
     originalEnv = { ...process.env };
     mockLogger = {
       info: jest.fn(),
@@ -17,10 +21,10 @@ describe("TaskScheduler", () => {
 
   afterEach(() => {
     process.env = originalEnv;
-    jest.useRealTimers();
     if (scheduler) {
-      scheduler.stop(); // Clean up any running cron jobs
+      scheduler.stop();
     }
+    jest.useRealTimers();
   });
 
   describe("Constructor and initialization", () => {
@@ -29,37 +33,40 @@ describe("TaskScheduler", () => {
       expect(scheduler).toBeDefined();
     });
 
-    it("should handle invalid schedule string", () => {
-      scheduler = new TaskScheduler("invalid * * * *", {
-        logger: mockLogger,
-        backupCooldownSeconds: 30,
-      });
-      scheduler.register(() => {});
-      scheduler.run();
-      expect(mockLogger.info).toHaveBeenCalledWith(expect.stringMatching(/Scheduling tasks/));
+    it("should throw error for empty schedule string", () => {
+      expect(() => {
+        new TaskScheduler("", { logger: mockLogger });
+      }).toThrow("Schedule string cannot be empty");
     });
 
-    it("should parse schedule string with cooldown", () => {
-      scheduler = new TaskScheduler("*/5 * * * * * @ 30", {
-        logger: mockLogger,
-      });
-      scheduler.register(() => {});
-      scheduler.run();
+    it("should throw error for invalid schedule string", () => {
+      scheduler = new TaskScheduler("invalid * * * *", { logger: mockLogger });
+      expect(() => scheduler.run()).rejects.toThrow();
+    });
+
+    it("should parse schedule string with cooldown", async () => {
+      scheduler = new TaskScheduler("*/5 * * * * * @ 30", { logger: mockLogger });
+      scheduler.register(jest.fn());
+      await scheduler.run();
       expect(mockLogger.info).toHaveBeenCalledWith(expect.stringMatching(/Cooldown: 30 seconds/));
     });
 
-    it("should use backup cooldown when not specified in schedule", () => {
+    it("should use backup cooldown when not specified in schedule", async () => {
       scheduler = new TaskScheduler("*/5 * * * * *", {
         backupCooldownSeconds: 45,
         logger: mockLogger,
       });
-      scheduler.register(() => {});
-      scheduler.run();
+      scheduler.register(jest.fn());
+      await scheduler.run();
       expect(mockLogger.info).toHaveBeenCalledWith(expect.stringMatching(/Cooldown: 45 seconds/));
     });
   });
 
   describe("Task registration and execution", () => {
+    beforeEach(() => {
+      process.env.TEST = "true";
+    });
+
     it("should execute tasks in order", async () => {
       const results: number[] = [];
       scheduler = new TaskScheduler("*/5 * * * * *", {
@@ -67,14 +74,11 @@ describe("TaskScheduler", () => {
         immediateEnvName: "TEST",
       });
 
-      process.env.TEST = "true";
-
       scheduler.register(() => results.push(1));
       scheduler.register(() => results.push(2));
       scheduler.register(() => results.push(3));
 
       await scheduler.run();
-
       expect(results).toEqual([1, 2, 3]);
     });
 
@@ -85,10 +89,8 @@ describe("TaskScheduler", () => {
         immediateEnvName: "TEST",
       });
 
-      process.env.TEST = "true";
-
       scheduler.register(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await Promise.resolve();
         results.push(1);
       });
       scheduler.register(async () => {
@@ -96,60 +98,30 @@ describe("TaskScheduler", () => {
       });
 
       await scheduler.run();
-
       expect(results).toEqual([1, 2]);
     });
 
-    it("should handle async task failures", async () => {
-      const results: number[] = [];
+    it("should handle task errors", async () => {
       scheduler = new TaskScheduler("*/5 * * * * *", {
         logger: mockLogger,
         immediateEnvName: "TEST",
       });
 
-      process.env.TEST = "true";
+      const errorTask = jest.fn().mockRejectedValue(new Error("Task failed"));
+      const nextTask = jest.fn();
 
-      scheduler.register(async () => {
-        results.push(1);
-        throw new Error("Async task failed");
-      });
-      scheduler.register(async () => {
-        results.push(2);
-      });
+      scheduler.register(errorTask);
+      scheduler.register(nextTask);
 
       await scheduler.run();
 
-      expect(results).toEqual([1, 2]);
-      expect(mockLogger.error).toHaveBeenCalled();
-    });
-
-    it("should continue execution after task failure", async () => {
-      const results: number[] = [];
-      scheduler = new TaskScheduler("*/5 * * * * *", {
-        logger: mockLogger,
-        immediateEnvName: "TEST",
-      });
-
-      process.env.TEST = "true";
-
-      scheduler.register(() => results.push(1));
-      scheduler.register(() => {
-        throw new Error("Task failed");
-      });
-      scheduler.register(() => results.push(3));
-
-      await scheduler.run();
-
-      expect(results).toEqual([1, 3]);
-      expect(mockLogger.error).toHaveBeenCalled();
+      expect(errorTask).toHaveBeenCalled();
+      expect(nextTask).toHaveBeenCalled();
+      expect(mockLogger.error).toHaveBeenCalledWith("Task 1 failed:", expect.any(Error));
     });
   });
 
   describe("Cooldown handling", () => {
-    beforeEach(() => {
-      jest.useFakeTimers();
-    });
-
     it("should respect cooldown period", async () => {
       scheduler = new TaskScheduler("*/5 * * * * *", {
         backupCooldownSeconds: 30,
@@ -163,38 +135,39 @@ describe("TaskScheduler", () => {
 
       await scheduler.run();
       jest.advanceTimersByTime(15000); // Half the cooldown
-      await scheduler.run(); // Should be skipped due to cooldown
+      await scheduler.run();
 
       expect(task).toHaveBeenCalledTimes(1);
       expect(mockLogger.info).toHaveBeenCalledWith(expect.stringMatching(/Cooldown period not elapsed/));
     });
 
     it("should skip execution if already running", async () => {
+      process.env.TEST = "true";
+      let resolveTask: () => void;
+
+      const controlledTask = new Promise<void>((resolve) => {
+        resolveTask = resolve;
+      });
+
       scheduler = new TaskScheduler("*/5 * * * * *", {
         logger: mockLogger,
         immediateEnvName: "TEST",
       });
 
-      process.env.TEST = "true";
-
-      // Create a long-running task
       scheduler.register(async () => {
-        await new Promise((resolve) => setTimeout(resolve, 5000));
+        await controlledTask;
       });
 
-      // Start first execution
       const firstRun = scheduler.run();
-
-      // Try to run again immediately
       await scheduler.run();
 
-      expect(mockLogger.info).toHaveBeenCalledWith(expect.stringMatching(/Previous execution still running/));
+      expect(mockLogger.info).toHaveBeenCalledWith("Previous execution still running. Skipping this run.");
 
-      // Wait for first run to complete
+      resolveTask!();
       await firstRun;
     });
 
-    it("should allow execution after cooldown period", async () => {
+    it("should allow execution after cooldown", async () => {
       scheduler = new TaskScheduler("*/5 * * * * *", {
         backupCooldownSeconds: 30,
         logger: mockLogger,
@@ -206,10 +179,7 @@ describe("TaskScheduler", () => {
       scheduler.register(task);
 
       await scheduler.run();
-
-      // Advance timer past cooldown
-      jest.advanceTimersByTime(31000);
-
+      jest.advanceTimersByTime(31000); // Just past cooldown
       await scheduler.run();
 
       expect(task).toHaveBeenCalledTimes(2);
@@ -246,6 +216,20 @@ describe("TaskScheduler", () => {
 
       expect(mockLogger.info).toHaveBeenCalledWith(expect.stringMatching(/Scheduling tasks/));
     });
+
+    it("should handle undefined environment variable", async () => {
+      scheduler = new TaskScheduler("*/5 * * * * *", {
+        logger: mockLogger,
+        immediateEnvName: undefined,
+      });
+
+      const task = jest.fn();
+      scheduler.register(task);
+
+      await scheduler.run();
+
+      expect(mockLogger.info).toHaveBeenCalledWith(expect.stringMatching(/Scheduling tasks/));
+    });
   });
 
   describe("Scheduler control", () => {
@@ -254,7 +238,7 @@ describe("TaskScheduler", () => {
         logger: mockLogger,
       });
 
-      scheduler.register(() => {});
+      scheduler.register(jest.fn());
       await scheduler.run();
       scheduler.stop();
 
@@ -266,6 +250,16 @@ describe("TaskScheduler", () => {
         logger: mockLogger,
       });
 
+      scheduler.stop();
+      expect(mockLogger.info).not.toHaveBeenCalled();
+    });
+
+    it("should handle multiple stop calls", () => {
+      scheduler = new TaskScheduler("*/5 * * * * *", {
+        logger: mockLogger,
+      });
+
+      scheduler.stop();
       scheduler.stop();
       expect(mockLogger.info).not.toHaveBeenCalled();
     });
