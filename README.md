@@ -15,13 +15,13 @@ A flexible task scheduler for Node.js applications that supports cron patterns, 
 ## Installation
 
 ```bash
-npm install task-scheduler
+npm install @corundex/task-scheduler
 ```
 
 ## Basic Usage
 
 ```typescript
-import { TaskScheduler } from 'task-scheduler';
+import { TaskScheduler } from '@corundex/task-scheduler';
 
 const scheduler = new TaskScheduler('*/5 * * * * * @ 30');
 
